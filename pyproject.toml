@@ -1,0 +1,114 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aicoder-debt"
+version = "0.1.0"
+description = "AI Coder Debt metrics for LLM-generated multi-component systems"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "AI Coder Debt Research Team" }
+]
+keywords = [
+    "ai",
+    "llm",
+    "code-quality",
+    "technical-debt",
+    "deployment",
+    "metrics",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "pydantic>=2.0",
+    "click>=8.0",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+maintainability = [
+    "radon>=6.0",
+    "pylint>=3.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=24.0",
+    "mypy>=1.0",
+    "isort>=5.0",
+    "ruff>=0.1.0",
+]
+all = [
+    "aicoder-debt[maintainability,dev]",
+]
+
+[project.scripts]
+aicoder-debt = "aicoder_debt.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aicoder-debt/aicoder-debt"
+Documentation = "https://github.com/aicoder-debt/aicoder-debt#readme"
+Repository = "https://github.com/aicoder-debt/aicoder-debt"
+Issues = "https://github.com/aicoder-debt/aicoder-debt/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aicoder_debt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["src/aicoder_debt"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py39"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]

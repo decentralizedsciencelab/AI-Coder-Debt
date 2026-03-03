@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgres://db:5432/app
+      - REDIS_URL=redis://cache:6379
+    depends_on:
+      - db
+      - cache
+
+  db:
+    image: postgres:14
+    environment:
+      - POSTGRES_DB=app
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  cache:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  worker:
+    build: ./worker
+    environment:
+      - DATABASE_URL=postgres://db:5432/app
+      - REDIS_URL=redis://cache:6379
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+
+volumes:
+  postgres_data:
