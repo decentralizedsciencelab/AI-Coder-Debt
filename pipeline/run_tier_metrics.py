@@ -111,7 +111,7 @@ def discover_corpus(data_root: Path) -> list[dict]:
                 "source": "human_baseline",
             })
 
-    # ── 4. AI Python baseline (9 repos, self-declared AI-generated) ──
+    # ── 4. AI Python baseline (17 repos, self-declared AI-generated) ──
     ai_py = data_root / "ai_python_baseline"
     if ai_py.exists():
         for proj_dir in sorted(ai_py.iterdir()):
