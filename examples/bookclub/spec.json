@@ -1,0 +1,12 @@
+{
+  "spec_id": "web-011",
+  "domain": "web",
+  "name": "BookClub",
+  "description": "A reading-group platform where members create clubs, propose books, vote on the next read, and post chapter-level discussion threads.",
+  "components": [
+    "React SPA for browsing clubs, voting, and discussion",
+    "REST API for clubs, books, votes, and threads",
+    "PostgreSQL database with schema and seed data",
+    "Background worker that closes expired votes and emails results"
+  ]
+}

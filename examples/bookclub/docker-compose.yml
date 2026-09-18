@@ -1,0 +1,79 @@
+name: bookclub
+
+services:
+  database:
+    build: ./database
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bookclub}
+      POSTGRES_USER: ${POSTGRES_USER:-bookclub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bookclub}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: ./backend
+    environment:
+      PORT: 4000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bookclub}:${POSTGRES_PASSWORD:-bookclub}@database:5432/${POSTGRES_DB:-bookclub}
+      JWT_SECRET: ${JWT_SECRET:-replace-this-secret-before-production}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+    depends_on:
+      database:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bookclub}:${POSTGRES_PASSWORD:-bookclub}@database:5432/${POSTGRES_DB:-bookclub}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-15000}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM: ${EMAIL_FROM:-BookClub <results@bookclub.local>}
+    depends_on:
+      database:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-3000}:80"
+    restart: unless-stopped
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports:
+      - "${MAILPIT_WEB_PORT:-8025}:8025"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+

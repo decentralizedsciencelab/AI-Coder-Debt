@@ -10,6 +10,19 @@ from ..constants import JS_PATTERNS, PYTHON_PATTERNS
 from ..models import APICall, APIEndpoint
 from .base import BaseExtractor
 
+# Hosts that always denote this machine, and therefore this system.
+LOOPBACK_HOSTS: frozenset[str] = frozenset(
+    {"localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"}
+)
+
+# HTTP methods recognised in file-based and Go route declarations.
+HTTP_METHODS: tuple[str, ...] = (
+    "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS",
+)
+
+# Go source, for router registrations.
+GO_PATTERNS: list[str] = ["*.go"]
+
 
 class InterfaceExtractor(BaseExtractor):
     """Extract API calls and endpoint definitions from code."""
@@ -53,9 +66,14 @@ class InterfaceExtractor(BaseExtractor):
             r"axios\.(get|post|put|delete|patch)\s*\(\s*['\"`]([^'\"`]+)['\"`]",
             re.IGNORECASE,
         ),
+        # The options object must be the one belonging to *this* call, so
+        # it is matched immediately after the URL and bounded to a single
+        # level of nesting. An unbounded ``.*?`` under re.DOTALL reached
+        # into later functions, borrowing their method and swallowing the
+        # calls in between.
         "fetch": re.compile(
-            r"fetch\s*\(\s*['\"`]([^'\"`]+)['\"`](?:.*?method\s*:\s*['\"`](\w+)['\"`])?",
-            re.DOTALL,
+            r"fetch\s*\(\s*['\"`]([^'\"`]+)['\"`]"
+            r"(?:\s*,\s*\{(?P<opts>(?:[^{}]|\{[^{}]*\})*)\})?"
         ),
         "request": re.compile(
             r"request\.(get|post|put|delete|patch)\s*\(\s*['\"`]([^'\"`]+)['\"`]",
@@ -133,6 +151,156 @@ class InterfaceExtractor(BaseExtractor):
             content = self.read_file(js_file)
             if content:
                 endpoints.extend(self._extract_js_endpoints(js_file, content))
+
+        # Routes declared by file location rather than by a call
+        endpoints.extend(self._extract_file_based_endpoints())
+
+        # Go routers
+        for go_file in self.find_files(GO_PATTERNS):
+            content = self.read_file(go_file)
+            if content:
+                endpoints.extend(self._extract_go_endpoints(go_file, content))
+
+        return endpoints
+
+    def _extract_file_based_endpoints(self) -> list[APIEndpoint]:
+        """Extract Next.js routes, which are declared by file path.
+
+        Neither router writes a path anywhere in the source: ``app`` puts
+        the route at ``app/api/<segments>/route.ts`` and names the method
+        by exporting a function called after it, while ``pages`` puts it
+        at ``pages/api/<segments>.ts`` behind one method-agnostic handler.
+        A project using either convention therefore declares no endpoints
+        the call-site patterns can see, and every call to its own API
+        reads as unmatched.
+        """
+        endpoints: list[APIEndpoint] = []
+        suffixes = {".js", ".jsx", ".ts", ".tsx", ".mjs"}
+
+        for base in ("app", "src/app"):
+            root = self.project_path / base / "api"
+            if not root.is_dir():
+                continue
+            for route_file in root.rglob("route.*"):
+                if route_file.suffix not in suffixes or self._should_skip_path(
+                    route_file
+                ):
+                    continue
+                path = self._file_route_path(route_file.parent.relative_to(root))
+                content = self.read_file(route_file)
+                methods = [
+                    m
+                    for m in HTTP_METHODS
+                    if re.search(
+                        rf"export\s+(?:async\s+)?(?:function\s+{m}\b"
+                        rf"|const\s+{m}\b)",
+                        content,
+                    )
+                ]
+                for method in methods or ["*"]:
+                    endpoints.append(
+                        APIEndpoint(
+                            file_path=self.relative_path(route_file),
+                            line_number=1,
+                            method=method,
+                            path=path,
+                            handler=None,
+                        )
+                    )
+
+        for base in ("pages", "src/pages"):
+            root = self.project_path / base / "api"
+            if not root.is_dir():
+                continue
+            for handler_file in root.rglob("*"):
+                if (
+                    not handler_file.is_file()
+                    or handler_file.suffix not in suffixes
+                    or self._should_skip_path(handler_file)
+                ):
+                    continue
+                rel = handler_file.relative_to(root).with_suffix("")
+                if rel.name == "index":
+                    rel = rel.parent
+                endpoints.append(
+                    APIEndpoint(
+                        file_path=self.relative_path(handler_file),
+                        line_number=1,
+                        method="*",
+                        path=self._file_route_path(rel),
+                        handler=None,
+                    )
+                )
+
+        return endpoints
+
+    @staticmethod
+    def _file_route_path(relative: Path) -> str:
+        """Turn a route directory into a path, normalising parameters.
+
+        ``users/[id]`` becomes ``/api/users/{id}`` so the existing
+        parameter handling in pattern building treats it as a wildcard.
+        Catch-all segments (``[...slug]``) match any remaining path.
+        """
+        segments = []
+        for part in relative.parts:
+            if part in (".", ""):
+                continue
+            if part.startswith("[") and part.endswith("]"):
+                inner = part[1:-1].lstrip(".")
+                segments.append("{" + inner + "}")
+            else:
+                segments.append(part)
+        return "/api" + ("/" + "/".join(segments) if segments else "")
+
+    def _extract_go_endpoints(
+        self, file_path: Path, content: str
+    ) -> list[APIEndpoint]:
+        """Extract routes registered through a Go router.
+
+        Handles the common ``router.GET("/path", handler)`` form together
+        with ``Group`` prefixes, since a route registered on
+        ``api := router.Group("/api")`` serves ``/api/...`` rather than
+        the literal string at the call site.
+        """
+        endpoints: list[APIEndpoint] = []
+
+        prefixes: dict[str, str] = {}
+        for match in re.finditer(
+            r"(\w+)\s*:?=\s*[\w.]+\.Group\(\s*[\"`]([^\"`]*)[\"`]", content
+        ):
+            prefixes[match.group(1)] = match.group(2).rstrip("/")
+
+        method_pattern = re.compile(
+            r"(\w+)\.(" + "|".join(HTTP_METHODS) + r")\(\s*[\"`]([^\"`]*)[\"`]"
+        )
+        for match in method_pattern.finditer(content):
+            receiver, method, route = match.groups()
+            path = prefixes.get(receiver, "") + route
+            endpoints.append(
+                APIEndpoint(
+                    file_path=self.relative_path(file_path),
+                    line_number=content[: match.start()].count("\n") + 1,
+                    method=method,
+                    path=path or "/",
+                    handler=None,
+                )
+            )
+
+        for match in re.finditer(
+            r"(\w+)\.(?:HandleFunc|Handle)\(\s*[\"`]([^\"`]*)[\"`]", content
+        ):
+            receiver, route = match.groups()
+            path = prefixes.get(receiver, "") + route
+            endpoints.append(
+                APIEndpoint(
+                    file_path=self.relative_path(file_path),
+                    line_number=content[: match.start()].count("\n") + 1,
+                    method="*",
+                    path=path or "/",
+                    handler=None,
+                )
+            )
 
         return endpoints
 
@@ -258,7 +426,11 @@ class InterfaceExtractor(BaseExtractor):
 
                 if lib_name == "fetch":
                     endpoint = match.group(1)
-                    method = match.group(2).upper() if match.group(2) else "GET"
+                    opts = match.groupdict().get("opts") or ""
+                    verb = re.search(
+                        r"method\s*:\s*['\"`](\w+)['\"`]", opts
+                    )
+                    method = verb.group(1).upper() if verb else "GET"
                 else:
                     method = match.group(1).upper()
                     endpoint = match.group(2)
@@ -309,31 +481,59 @@ class InterfaceExtractor(BaseExtractor):
         return endpoints
 
     def _is_internal_url(self, url: str) -> bool:
-        """Check if a URL is internal (relative or localhost).
+        """Check whether a call can be attributed to this system.
 
-        Args:
-            url: URL to check.
+        Internal means the target is plausibly served by this project, so
+        ICR can ask whether a matching endpoint exists. Three forms
+        qualify: a host-relative path, an absolute URL on a loopback
+        host, and a URL whose host comes from configuration -- the
+        ``${API_URL}/api/tasks`` shape is how a frontend is *supposed* to
+        reach its own backend, and treating it as unattributable discards
+        correct measurements.
 
-        Returns:
-            True if the URL is internal.
+        What must not qualify is an explicit third-party host. A key or
+        id interpolated into the path does not make the host ours, so
+        ``https://api.github.com/orgs/${owner}`` is external: counting it
+        as internal guarantees an unmatched call that no local endpoint
+        could ever satisfy.
+
+        The residual imprecision is a configured host that points at a
+        third party (an LLM API, a managed GraphQL endpoint), or a
+        loopback port served by a different product running locally.
+        Both still read as internal, because nothing in the source
+        distinguishes them from the project's own service.
         """
-        # Check for template variables
-        if "${" in url or "{" in url or "{{" in url:
-            return True
+        url = url.strip()
+        if not url:
+            return False
 
-        # Check for relative URLs
+        if "://" in url:
+            authority = url.split("://", 1)[1].split("/", 1)[0]
+            # Strip any credentials, keeping the host[:port] portion.
+            authority = authority.rsplit("@", 1)[-1]
+            if "$" in authority or "{" in authority:
+                # Host supplied by configuration; conventionally our own.
+                return True
+            host = authority
+            if host.startswith("["):  # bracketed IPv6 literal
+                host = host.partition("]")[0] + "]"
+            elif host.count(":") == 1:
+                host = host.rsplit(":", 1)[0]
+            return host.lower() in LOOPBACK_HOSTS
+
         if url.startswith("/") or url.startswith("./"):
             return True
 
-        # Check for localhost
-        if "localhost" in url or "127.0.0.1" in url:
+        # A leading placeholder is a configured base URL for our own API.
+        if url.startswith("$") or url.startswith("{"):
+            return True
+        if "process.env" in url or "os.environ" in url:
             return True
 
-        # Check for environment variable placeholders
-        if url.startswith("$") or "process.env" in url or "os.environ" in url:
-            return True
-
-        return False
+        # Extractors capture the first token after the call parenthesis,
+        # which for ``requests.get(video_url)`` is an identifier rather
+        # than a URL. Require a path separator before treating it as one.
+        return "/" in url
 
     def _find_handler_name(self, content: str, start_pos: int) -> str | None:
         """Find the handler function name after a decorator.

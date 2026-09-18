@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .analyzer import AICoderDebtAnalyzer
+from .levels import LevelScores, score_analysis
 from .models import AnalysisResult
 from .reports.html_report import HTMLReportGenerator
 from .reports.json_report import JSONReportGenerator
@@ -109,6 +111,147 @@ def analyze(
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
+
+
+@main.command()
+@click.argument("project_path", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format",
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    help="Write the report to a file instead of stdout",
+)
+@click.option(
+    "--judge/--no-judge",
+    default=False,
+    help="Run LLM-as-Judge for L4 (needs an API key; costs tokens)",
+)
+@click.option(
+    "--sdd",
+    type=float,
+    default=None,
+    help="Security debt density per KLOC, an optional L3 input",
+)
+@click.option(
+    "--skip-maintainability",
+    is_flag=True,
+    help="Skip Tier 4 (radon/pylint); leaves L3 unmeasured",
+)
+def score(
+    project_path: str,
+    output_format: str,
+    output: Optional[str],
+    judge: bool,
+    sdd: Optional[float],
+    skip_maintainability: bool,
+) -> None:
+    """Score one system: per-level debt (L1-L4) and composite ACDS.
+
+    Runs the tier metrics on PROJECT_PATH and folds them into the four
+    level scores and the composite.  Levels whose inputs are unavailable
+    are reported as unmeasured and excluded from ACDS.
+    """
+    try:
+        analyzer = AICoderDebtAnalyzer(
+            skip_maintainability=skip_maintainability,
+        )
+        with console.status("[bold green]Analyzing project..."):
+            result = analyzer.analyze(project_path)
+
+        judge_scores = None
+        if judge:
+            with console.status("[bold green]Running LLM-as-Judge..."):
+                judge_scores = _run_judge(project_path)
+
+        scores = score_analysis(result, judge=judge_scores, sdd=sdd)
+
+        if output_format == "json":
+            report = json.dumps(scores.to_dict(), indent=2)
+        else:
+            report = None
+            _print_levels(scores)
+
+        if output:
+            if report is None:
+                report = json.dumps(scores.to_dict(), indent=2)
+            Path(output).write_text(report, encoding="utf-8")
+            console.print(f"[green]Report saved to {output}[/green]")
+        elif report is not None:
+            click.echo(report)
+
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
+def _run_judge(project_path: str) -> dict[str, float]:
+    """Run all five LLM-as-Judge metrics, returning native-unit scores."""
+    from .levels import NATIVE_MARKER
+    from .metrics.llm_judge import LLMJudge
+
+    judge = LLMJudge()
+    report = judge.judge_all(project_path)
+    scores: dict[str, float] = {NATIVE_MARKER: True}  # type: ignore[dict-item]
+    for metric in (
+        "defect_density", "vulnerability_density", "deployment_risk",
+        "ownership_void", "specification_alignment",
+    ):
+        res = getattr(report, metric, None)
+        if res is not None:
+            scores[metric] = res.native_score
+    return scores
+
+
+_LEVEL_LABELS = [
+    ("l1_debt", "L1", "System Existence", "1 - DRS"),
+    ("l2_debt", "L2", "System Coherence", "mean(1-ICR, 1-CCS, URR)"),
+    ("l3_debt", "L3", "Component Quality", "mean(CCX, CSD, SDD) capped"),
+    ("l4_debt", "L4", "Traceability", "mean of 5 LLM-as-Judge metrics"),
+]
+
+
+def _print_levels(scores: LevelScores) -> None:
+    """Render per-level debt as a table."""
+    table = Table(title=f"AI Coder Debt — {scores.project_path}")
+    table.add_column("Level", style="cyan", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("Debt", justify="right")
+    table.add_column("Formula", style="dim")
+
+    for attr, tag, name, formula in _LEVEL_LABELS:
+        value = getattr(scores, attr)
+        if value is None:
+            shown, style = "unmeasured", "yellow"
+        else:
+            shown = f"{value:.3f}"
+            style = "red" if value >= 0.5 else "green"
+        table.add_row(tag, name, f"[{style}]{shown}[/{style}]", formula)
+
+    acds = scores.acds
+    acds_shown = "unmeasured" if acds is None else f"{acds:.3f}"
+    table.add_row(
+        "ACDS", "Composite", f"[bold]{acds_shown}[/bold]",
+        f"1 - prod(1 - L) over {scores.levels_measured} level(s)",
+    )
+    console.print(table)
+
+    inputs = ", ".join(
+        f"{k}={v:.3f}" for k, v in scores.inputs.items() if v is not None
+    )
+    if inputs:
+        console.print(f"[dim]Inputs: {inputs}[/dim]")
+    if scores.unavailable:
+        console.print(
+            f"[yellow]Unmeasured: {', '.join(scores.unavailable)}[/yellow] "
+            "[dim](excluded from ACDS, not counted as zero debt)[/dim]"
+        )
 
 
 @main.command()
@@ -333,6 +476,83 @@ def ccx(project_path: str) -> None:
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
+
+
+@main.command("ownership-signals")
+@click.argument("project_path", type=click.Path(exists=True))
+@click.option(
+    "--children",
+    is_flag=True,
+    help="Treat each immediate subdirectory as a separate project.",
+)
+@click.option("--format", "output_format", type=click.Choice(["table", "json"]),
+              default="table")
+def ownership_signals(project_path: str, children: bool, output_format: str) -> None:
+    """Report whether projects carry ownership metadata.
+
+    The Ownership Void Index is defined over repository signals
+    (CODEOWNERS entries, substantive edits by a distinct human author).
+    This reports whether those signals exist; it does not estimate the
+    index. A project without them is unmeasured by that definition, not
+    maximally unowned.
+    """
+    from .ownership import survey_ownership_signals
+
+    root = Path(project_path)
+    if children:
+        targets = sorted(d for d in root.iterdir() if d.is_dir())
+    else:
+        targets = [root]
+
+    summary = survey_ownership_signals(targets)
+
+    if output_format == "json":
+        click.echo(json.dumps({
+            "total": summary.total,
+            "measurable": summary.measurable,
+            "unmeasurable": summary.unmeasurable,
+            "measurable_fraction": summary.measurable_fraction,
+            "projects": [
+                {
+                    "path": s.path,
+                    "has_git": s.has_git,
+                    "commit_count": s.commit_count,
+                    "distinct_authors": s.distinct_authors,
+                    "has_codeowners": s.has_codeowners,
+                    "measurable": s.measurable,
+                    "reason": s.reason,
+                }
+                for s in summary.signals
+            ],
+        }, indent=2))
+        return
+
+    table = Table(title=f"Ownership signals - {root}")
+    table.add_column("Project", style="cyan")
+    table.add_column("Commits", justify="right")
+    table.add_column("Authors", justify="right")
+    table.add_column("CODEOWNERS", justify="center")
+    table.add_column("Measurable", justify="center")
+    table.add_column("Reason")
+
+    for sig in summary.signals:
+        table.add_row(
+            Path(sig.path).name,
+            str(sig.commit_count),
+            str(sig.distinct_authors),
+            "yes" if sig.has_codeowners else "-",
+            "[green]yes[/green]" if sig.measurable else "[red]no[/red]",
+            sig.reason,
+        )
+
+    console.print(table)
+    frac = summary.measurable_fraction
+    pct = "n/a" if frac is None else f"{frac:.1%}"
+    console.print(
+        f"Repository-based Ownership Void Index is computable for "
+        f"{summary.measurable} of {summary.total} projects ({pct}). "
+        f"The rest are unmeasured by that definition."
+    )
 
 
 @main.command()
