@@ -27,7 +27,9 @@ import json
 import logging
 import os
 import re
+import statistics
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +44,7 @@ except ImportError:
     _openai = None  # type: ignore[assignment]
 
 from ..constants import SKIP_DIRS
+from ..levels import NATIVE_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,179 @@ _LEAKAGE_CONTROL = (
     "assume the existence of additional files, documentation, tests, or "
     "infrastructure not shown.\n"
 )
+
+SCALE_ORDINAL = "ordinal_1_5"
+SCALE_NATIVE = "native"
+
+# Native unit of each metric, and the native midpoint of each 1-5 band.
+# Midpoints are read directly off the calibration anchors in the rubrics
+# below (e.g. the defect anchor "2-5 per KLOC" -> 3.5); the open-ended top
+# anchor uses the lower edge scaled by the width of the one beneath it.
+# These drive ordinal->native conversion of the legacy ordinal results.
+METRIC_NATIVE_UNITS: dict[str, str] = {
+    "defect_density": "defects per KLOC",
+    "vulnerability_density": "vulnerabilities per KLOC",
+    "deployment_risk": "probability in [0,1]",
+    "ownership_void": "percent of codebase",
+    "specification_alignment": "coherence in [0,1], higher is better",
+}
+
+METRIC_BAND_MIDPOINTS: dict[str, tuple[float, float, float, float, float]] = {
+    "defect_density": (1.0, 3.5, 7.5, 15.0, 25.0),
+    "vulnerability_density": (0.5, 2.0, 4.0, 7.5, 15.0),
+    "deployment_risk": (0.1, 0.3, 0.5, 0.7, 0.9),
+    "ownership_void": (10.0, 30.0, 50.0, 70.0, 90.0),
+    "specification_alignment": (0.1, 0.3, 0.5, 0.7, 0.9),
+}
+
+# Valid range of each metric on its native scale.  ``None`` upper bounds
+# are open: the density metrics have no ceiling, though values far above
+# the top calibration anchor are logged as suspect.
+METRIC_NATIVE_RANGES: dict[str, tuple[float, float | None]] = {
+    "defect_density": (0.0, None),
+    "vulnerability_density": (0.0, None),
+    "deployment_risk": (0.0, 1.0),
+    "ownership_void": (0.0, 100.0),
+    "specification_alignment": (0.0, 1.0),
+}
+
+
+def ordinal_to_native(metric_name: str, score: float) -> float:
+    """Convert a 1-5 ordinal band to the metric's native unit.
+
+    Uses the native interval midpoint that each rubric band already
+    names, so the mapping is documented by the rubric rather than chosen
+    here.  The conversion is lossy: the ordinal instrument resolves five
+    strata where the native instrument resolved a continuum.
+    """
+    bands = METRIC_BAND_MIDPOINTS.get(metric_name)
+    if bands is None:
+        raise KeyError(f"No band mapping for metric {metric_name!r}")
+    idx = max(1, min(5, int(round(float(score))))) - 1
+    return bands[idx]
+
+
+class ScaleError(ValueError):
+    """Base class for scale-determination failures."""
+
+
+class AmbiguousScaleError(ScaleError):
+    """Scores are legal on both scales, so their units cannot be inferred."""
+
+
+class ConflictingScaleError(ScaleError):
+    """Scores carry decisive evidence for both scales at once."""
+
+
+# Largest legal ordinal band.  A value above this cannot be a band index.
+ORDINAL_MAX = 5.0
+
+
+def infer_scale(
+    samples: Iterable[tuple[str, float]],
+) -> str | None:
+    """Infer whether *samples* are native-unit or 1-5 ordinal scores.
+
+    Inference rests only on values that are impossible on one scale:
+
+    * above the metric's native ceiling -- must be an ordinal band
+      (a ``deployment_risk`` of 3.0 cannot be a probability);
+    * above :data:`ORDINAL_MAX` -- must be native
+      (an ``ownership_void`` of 90 is not a band index).
+
+    Returns ``None`` when no observation is decisive.  This is the common
+    case for a lone ``ownership_void`` in [1, 5], which is simultaneously a
+    legal percentage and a legal band -- the reason a range check alone
+    cannot certify units.  One decisive observation settles a whole set, so
+    pass every score from a file rather than one metric at a time.
+
+    Raises:
+        ConflictingScaleError: if both scales are decisively indicated.
+    """
+    says_ordinal: list[str] = []
+    says_native: list[str] = []
+
+    for metric_name, score in samples:
+        bounds = METRIC_NATIVE_RANGES.get(metric_name)
+        if bounds is None:
+            continue
+        value = float(score)
+        _, native_max = bounds
+        if native_max is not None and value > native_max:
+            says_ordinal.append(f"{metric_name}={value:g}")
+        elif value > ORDINAL_MAX:
+            says_native.append(f"{metric_name}={value:g}")
+
+    if says_ordinal and says_native:
+        raise ConflictingScaleError(
+            "Scores indicate both scales at once: "
+            f"{', '.join(says_ordinal)} exceed their native range while "
+            f"{', '.join(says_native)} exceed the 1-5 ordinal range. "
+            "The set likely mixes results from different runs."
+        )
+    if says_ordinal:
+        return SCALE_ORDINAL
+    if says_native:
+        return SCALE_NATIVE
+    return None
+
+
+def native_scores(
+    samples: Iterable[tuple[str, float]],
+    scale: str | None = None,
+) -> dict[str, float]:
+    """Return a native-unit judge dict ready for :func:`compute_l4_debt`.
+
+    *samples* is an iterable of ``(metric_name, score)`` pairs, typically
+    every row of a stored results file; repeated metrics are averaged, so
+    per-run rows collapse to one score per metric.  The result carries
+    :data:`NATIVE_MARKER`, so it needs no further stamping.
+
+    Pass *scale* when the provenance is known.  Otherwise the scale is
+    inferred, and an undecidable set is an error rather than a guess:
+    silently reading an ordinal 3.67 as 3.67 percent would understate an
+    ownership void of roughly 70 percent by an order of magnitude.
+
+    Raises:
+        AmbiguousScaleError: if *scale* is omitted and cannot be inferred.
+        ConflictingScaleError: if the samples indicate both scales.
+    """
+    collected: dict[str, list[float]] = {}
+    for metric_name, score in samples:
+        collected.setdefault(metric_name, []).append(float(score))
+
+    if scale is None:
+        scale = infer_scale(
+            (name, value)
+            for name, values in collected.items()
+            for value in values
+        )
+    if scale is None:
+        raise AmbiguousScaleError(
+            "Cannot determine the scale of these scores: every value is "
+            "legal both as a native unit and as a 1-5 ordinal band. Pass "
+            f"scale={SCALE_NATIVE!r} or scale={SCALE_ORDINAL!r} explicitly, "
+            "sourcing it from the run that produced them."
+        )
+
+    result: dict[str, float] = {NATIVE_MARKER: True}  # type: ignore[dict-item]
+    for metric_name, values in collected.items():
+        mean = statistics.mean(values)
+        result[metric_name] = to_native(metric_name, mean, scale)
+    return result
+
+
+def to_native(metric_name: str, score: float, scale: str) -> float:
+    """Return *score* in the metric's native unit, given its *scale*."""
+    if scale == SCALE_NATIVE:
+        return float(score)
+    if scale == SCALE_ORDINAL:
+        return ordinal_to_native(metric_name, score)
+    raise ValueError(
+        f"Unknown score scale {scale!r} for {metric_name!r}; "
+        f"expected {SCALE_NATIVE!r} or {SCALE_ORDINAL!r}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Result models (dataclass -- lightweight, no Pydantic dependency)
@@ -832,7 +1008,27 @@ SOURCE CODE:
     def judge_ownership_void(
         self, project_path: Path, run_index: int = 0
     ) -> LLMJudgeResult:
-        """Estimate ownership void severity (1-5 ordinal)."""
+        """Estimate ownership void severity (1-5 ordinal).
+
+        Note the unit and the denominator when citing this alongside the
+        paper's definition.  The Ownership Void Index is *defined* as a
+        ratio of module counts, ``N_void / N_AI`` (Eq. eq:ovi).  This
+        estimate is not that arithmetic: the judge rates each system as a
+        single whole on a 1-5 band and never enumerates modules, so there
+        is no numerator or denominator to report.
+
+        The score is an ordinal band, not a percentage.  Convert it with
+        :func:`to_native` (band midpoints put 4 at 70 percent) before
+        comparing it to native-unit results or feeding
+        :func:`aicoder_debt.levels.compute_l4_debt`, which rejects
+        unconverted input.  Reading a band of 4 as 4 percent understates
+        the estimate by an order of magnitude.
+
+        Repository-signal measurement of the defined ratio requires
+        ownership metadata the corpora lack; see
+        :mod:`aicoder_debt.ownership` for detecting whether a given
+        project could support it.
+        """
         project_path = Path(project_path).resolve()
         source, _, kloc = self._collect_source(project_path)
 

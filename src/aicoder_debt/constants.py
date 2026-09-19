@@ -202,4 +202,15 @@ SKIP_DIRS: Final[set[str]] = {
     "coverage",
     ".coverage",
     "htmlcov",
+    # Test-fixture trees. These hold sample applications kept for a
+    # repository's own test suite, not the system under analysis; reading
+    # them attributes their calls, endpoints and code to the project.
+    "testdata",
+    "test-projects",
+    "test_projects",
+    "test-fixtures",
+    "test_fixtures",
+    "fixtures",
+    "__fixtures__",
+    "__mocks__",
 }

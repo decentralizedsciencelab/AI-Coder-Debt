@@ -62,6 +62,18 @@ class BaseExtractor(ABC):
                     files.append(file_path)
         return sorted(set(files))
 
+    def _project_relative_dirs(self, path: Path) -> tuple[str, ...]:
+        """Directory components of *path* relative to the project root.
+
+        Falls back to the whole path when *path* lies outside the
+        project, which only happens for callers passing unrelated paths.
+        """
+        try:
+            relative = Path(path).resolve().relative_to(self.project_path)
+        except ValueError:
+            relative = Path(path)
+        return relative.parts[:-1]
+
     def _should_skip_path(self, path: Path) -> bool:
         """Check if a path should be skipped.
 
@@ -71,7 +83,15 @@ class BaseExtractor(ABC):
         Returns:
             True if the path should be skipped.
         """
-        for part in path.parts:
+        # Only the directory components *inside the project* are
+        # checked. SKIP_DIRS names directories relative to the project
+        # root, so matching against the absolute path let an ancestor
+        # decide: a project stored under a directory called "build" had
+        # every file skipped and scored as empty. The final component is
+        # excluded too, because several entries (".env", "env", "build")
+        # are also legitimate file names -- scanning it would skip the
+        # ``.env`` config file as if it were a virtualenv.
+        for part in self._project_relative_dirs(path):
             if part in SKIP_DIRS:
                 return True
             # Check for wildcard patterns like *.egg-info

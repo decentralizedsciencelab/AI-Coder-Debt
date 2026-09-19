@@ -1,0 +1,21 @@
+version: "3.8"
+services:
+  checkout:
+    build: .
+    ports:
+      - "9001:9001"
+    environment:
+      SERVICE: checkout
+      CHECKOUT_PORT: "9001"
+      PAYMENTS_URL: http://payments:9002
+    depends_on:
+      - payments
+
+  payments:
+    build: .
+    ports:
+      - "9002:9002"
+    environment:
+      SERVICE: payments
+      PAYMENTS_PORT: "9002"
+      LEDGER_URL: http://ledger:9003

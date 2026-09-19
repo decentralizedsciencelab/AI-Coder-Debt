@@ -13,6 +13,12 @@ from ..constants import CONFIG_PATTERNS, JS_PATTERNS, PYTHON_PATTERNS
 from ..models import ConfigDefinition, ConfigReference
 from .base import BaseExtractor
 
+# Mapping keys whose children are environment variables rather than
+# structural configuration. Code references these by bare name.
+ENV_SECTION_KEYS: frozenset[str] = frozenset(
+    {"environment", "env", "environment_variables", "envvars"}
+)
+
 
 class ConfigExtractor(BaseExtractor):
     """Extract configuration definitions and references from code."""
@@ -302,6 +308,20 @@ class ConfigExtractor(BaseExtractor):
                 definitions.extend(
                     self._flatten_dict(value, file_path, f"{full_key}.")
                 )
+            elif isinstance(value, list) and key in ENV_SECTION_KEYS:
+                # docker-compose list form: ``environment: [FOO=bar, BAZ]``
+                for item in value:
+                    name, _, item_value = str(item).partition("=")
+                    name = name.strip()
+                    if not name:
+                        continue
+                    definitions.append(
+                        ConfigDefinition(
+                            file_path=self.relative_path(file_path),
+                            key=name,
+                            value=item_value.strip() or None,
+                        )
+                    )
             else:
                 str_value = str(value) if value is not None else None
                 definitions.append(
@@ -311,8 +331,26 @@ class ConfigExtractor(BaseExtractor):
                         value=str_value,
                     )
                 )
+                # A scalar inside an environment section defines an
+                # environment variable, which code references by its bare
+                # name.  Emit that name alongside the structural path so
+                # ``os.getenv("DB_HOST")`` can resolve against a
+                # ``services.api.environment.DB_HOST`` entry.
+                if self._parent_segment(prefix) in ENV_SECTION_KEYS:
+                    definitions.append(
+                        ConfigDefinition(
+                            file_path=self.relative_path(file_path),
+                            key=key,
+                            value=str_value,
+                        )
+                    )
 
         return definitions
+
+    @staticmethod
+    def _parent_segment(prefix: str) -> str:
+        """Return the innermost key of a dotted flatten prefix."""
+        return prefix.rstrip(".").rsplit(".", 1)[-1]
 
     def _extract_python_refs(
         self, file_path: Path, content: str

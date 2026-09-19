@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "checkout-flow"
+version = "1.0.0"
+description = "Checkout and payments services"
+requires-python = ">=3.9"
+dependencies = ["flask", "requests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["checkout_flow"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
